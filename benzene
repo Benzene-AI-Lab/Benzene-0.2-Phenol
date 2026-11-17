@@ -1,0 +1,44 @@
+#!/bin/sh
+# Benzene UCI engine launcher
+#
+# 用法（棋类 GUI / lichess-bot）：
+#   engine.dir  = 本文件所在目录
+#   engine.name = benzene
+#
+# 权重查找顺序：
+#   1. 环境变量 BENZENE_CKPT
+#   2. 本目录下的 *.pt（放在根目录或 weights/ 都行）
+#
+# 其他环境变量：
+#   BENZENE_SIMS    默认模拟次数（默认 800）
+#   BENZENE_PYTHON  Python 解释器（默认用同目录 venv 或系统 python3）
+DIR="$(cd "$(dirname "$0")" && pwd)"
+
+# 找 Python 解释器：优先项目 venv，其次系统
+if [ -n "$BENZENE_PYTHON" ]; then
+  PY="$BENZENE_PYTHON"
+elif [ -x "$DIR/../../.venv/bin/python" ]; then
+  PY="$DIR/../../.venv/bin/python"
+elif command -v python3 >/dev/null 2>&1; then
+  PY=python3
+else
+  echo "找不到 python3，请设置 BENZENE_PYTHON" >&2
+  exit 1
+fi
+
+# 找权重：环境变量 > 根目录 *.pt > weights/*.pt
+if [ -n "$BENZENE_CKPT" ]; then
+  CKPT="$BENZENE_CKPT"
+else
+  CKPT=$(ls "$DIR"/*.pt 2>/dev/null | head -1)
+  [ -z "$CKPT" ] && CKPT=$(ls "$DIR"/weights/*.pt 2>/dev/null | head -1)
+fi
+
+if [ -z "$CKPT" ] || [ ! -f "$CKPT" ]; then
+  echo "找不到权重文件。请把 .pt 放在 $DIR 或 $DIR/weights/，或设置 BENZENE_CKPT" >&2
+  exit 1
+fi
+
+exec "$PY" "$DIR/src/uci.py" \
+     --ckpt "$CKPT" \
+     --sims "${BENZENE_SIMS:-800}" "$@"
