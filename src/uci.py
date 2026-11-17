@@ -32,8 +32,9 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 from engine import MCTS, pick_move, visit_distribution
 from net import build as build_net
 
-ENGINE_NAME = "Benzene"
+ENGINE_NAME = "Benzene 0.2-Phenol"
 ENGINE_AUTHOR = "CollinsLiu615"
+ENGINE_VERSION = "1.0"
 
 
 def log(msg: str):
@@ -51,6 +52,8 @@ class UCIEngine:
         self.mcts = MCTS(self.net, device=device)
         self.sims = sims
         self.params = self.net.count_params()
+        self.hash_mb = 128
+        self.move_overhead_ms = 30
         self.board = chess.Board()
         self.scale = scale
         log(f"[Benzene] 加载 {Path(ckpt).name} · {scale} · {self.params/1e6:.2f}M")
@@ -59,10 +62,19 @@ class UCIEngine:
 
     def cmd_uci(self):
         out = [
-            f"id name {ENGINE_NAME} {self.scale} {self.params/1e6:.2f}M",
+            f"id name {ENGINE_NAME}",
             f"id author {ENGINE_AUTHOR}",
+            f"id version {ENGINE_VERSION}",
             "option name Simulations type spin default 800 min 1 max 100000",
             "option name Temperature type spin default 0 min 0 max 500",
+            # 标准选项：声明出来以便通过 CCRL / CuteChess / Arena 的兼容检查。
+            # Benzene 是固定结构的神经网络，不使用置换表也不多线程，这些值只记录不生效。
+            "option name Hash type spin default 128 min 1 max 4096",
+            "option name Threads type spin default 1 min 1 max 1",
+            "option name Ponder type check default false",
+            "option name UCI_Chess960 type check default false",
+            "option name UCI_LimitStrength type check default false",
+            "option name Move Overhead type spin default 30 min 0 max 5000",
             "uciok",
         ]
         self._send(out)
@@ -87,6 +99,18 @@ class UCIEngine:
             log(f"[Benzene] sims = {self.sims}")
         elif name == "temperature":
             pass   # 对局中固定 temperature=0
+        elif name == "hash":
+            self.hash_mb = int(value) if value.isdigit() else 128
+            log(f"[Benzene] hash = {self.hash_mb} MB（不使用，仅记录）")
+        elif name == "threads":
+            log(f"[Benzene] threads = {value}（单线程推理）")
+        elif name == "move overhead":
+            self.move_overhead_ms = int(value) if value.isdigit() else 30
+            log(f"[Benzene] move overhead = {self.move_overhead_ms} ms")
+        elif name == "ponder":
+            pass
+        elif name in ("uci_chess960", "uci_limitstrength"):
+            pass
 
     def cmd_position(self, parts: list[str]):
         if "startpos" in parts:
@@ -113,6 +137,37 @@ class UCIEngine:
                     log(f"[Benzene] 走法非法: {uci}")
                     break
 
+
+    # 单次网络前向的耗时（秒）。用一次干跑实测，避免写死。
+    _move_s = None
+
+    def _forward_seconds(self) -> float:
+        """每次 MCTS 模拟的秒数。实测后加 25% 保险，避免估低导致超时。"""
+        if UCIEngine._move_s is None:
+            import time as _t
+            b = chess.Board()
+            t0 = _t.time()
+            self.mcts.run(b, simulations=8)
+            UCIEngine._move_s = max((_t.time() - t0) / 9.0, 0.005) * 1.8
+        return UCIEngine._move_s
+
+    def _sims_for_ms(self, ms: float) -> int:
+        """把毫秒预算换算成 MCTS 模拟次数，留 25% 余量。"""
+        usable = max(ms - self.move_overhead_ms, 1) / 1000.0 * 0.55
+        return max(int(usable / self._forward_seconds()), 8)
+
+    @staticmethod
+    def _budget_ms(remaining_ms: int, inc_ms: int, movestogo: int | None) -> float:
+        """按剩余时间分配这一手的用时。"""
+        if movestogo and movestogo > 0:
+            share = remaining_ms / (movestogo + 1)
+        else:
+            # 无 movestogo 时按「还剩约 30 手」估算，取 1/30 再加增量
+            share = remaining_ms / 30.0
+        budget = share + inc_ms * 0.8
+        # 不要一次用掉超过剩余时间的 1/5，也不要超过 30 秒
+        return max(min(budget, remaining_ms * 0.2, 30000), 20)
+
     def cmd_go(self, parts: list[str]):
         t0 = time.time()
         b = self.board
@@ -121,17 +176,32 @@ class UCIEngine:
             self._send(["bestmove 0000"])
             return
 
-        # 解析时间限制（用不上就不管，固定用 sims）
-        nodes = None
-        if "nodes" in parts:
+        def arg(name):
             try:
-                nodes = int(parts[parts.index("nodes") + 1])
+                return int(parts[parts.index(name) + 1])
             except (ValueError, IndexError):
-                pass
+                return None
 
-        sims = self.sims
+        # 优先用 go 命令显式给的限制，其次是时钟，最后回退到固定的 sims
+        nodes = arg("nodes")
+        movetime = arg("movetime")
+        wtime, btime = arg("wtime"), arg("btime")
+        winc, binc = arg("winc"), arg("binc")
+        movestogo = arg("movestogo")
+
+        sims = None
         if nodes:
             sims = min(nodes, 100000)
+        elif movetime is not None:
+            sims = self._sims_for_ms(movetime)
+        elif wtime is not None or btime is not None:
+            mine = wtime if b.turn == chess.WHITE else btime
+            inc = (winc if b.turn == chess.WHITE else binc) or 0
+            if mine is not None:
+                sims = self._sims_for_ms(self._budget_ms(mine, inc, movestogo))
+
+        if sims is None:
+            sims = self.sims
 
         root = self.mcts.run(b, simulations=sims)
         _, mv = pick_move(root, temperature=0.0)
@@ -166,9 +236,22 @@ def main():
     ap.add_argument("--sims", type=int, default=800)
     ap.add_argument("--device", default="cpu")
     ap.add_argument("--threads", type=int, default=1)
+    ap.add_argument("--name", default="",
+                    help="覆盖 UCI id name（默认按权重文件名推断）")
     args = ap.parse_args()
 
     torch.set_num_threads(args.threads)
+
+    # 按权重文件名推断引擎名：benzene-0.2-phenol.pt -> Benzene 0.2-Phenol
+    global ENGINE_NAME
+    if args.name:
+        ENGINE_NAME = args.name
+    else:
+        stem = Path(args.ckpt).stem
+        parts = stem.split("-")
+        if len(parts) >= 3 and parts[0].lower() == "benzene":
+            ENGINE_NAME = f"Benzene {parts[1]}-{parts[2].capitalize()}"
+
     eng = UCIEngine(args.ckpt, args.sims, args.device)
 
     for raw in sys.stdin:
